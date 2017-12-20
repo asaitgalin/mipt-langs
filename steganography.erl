@@ -25,13 +25,14 @@
 -record(image, {
     type,
     headers,
-    contents
+    contents,
+    width
 }).
 
 read_image(bmp, Contents) ->
     case Contents of
         <<?BMP_HDR,_:32,Reserved1:16,Reserved2:16,Offset:32/little,StructSize:32/little,
-          _Width:32/little-signed,_Height:32/little-signed,_:16,BitCount:16/little,
+          Width:32/little-signed,_Height:32/little-signed,_:16,BitCount:16/little,
           Compression:32/little,_/binary>> ->
             case {Reserved1, Reserved2, StructSize} of
                 {0, 0, ?BITMAPV5HEADER_SIZE} ->
@@ -42,7 +43,8 @@ read_image(bmp, Contents) ->
                             Image = #image{
                                 type = bmp,
                                 headers = Headers,
-                                contents = Pixels
+                                contents = Pixels,
+                                width = Width
                             },
                             {ok, Image};
                         _ -> {error, "unsupported BMP image, only images with 24 bits "
@@ -85,12 +87,12 @@ process_chunks(Contents, Image, Zlib) ->
 
 process_chunk("IHDR", ChunkData, _, Rest, Zlib) ->
     case ChunkData of
-        <<_Width:32, _Height:32, BitDepth:8, ColorType:8, CompressionMethod:8,
+        <<Width:32, _Height:32, BitDepth:8, ColorType:8, CompressionMethod:8,
           FilterMethod:8, _InterlaceMethod:8, _/binary >> ->
             case {BitDepth, ColorType, CompressionMethod, FilterMethod} of
                 {?PNG_SUPPORTED_BIT_DEPTH, ?PNG_SUPPORTED_COLOR_TYPE,
                  ?PNG_SUPPORTED_COMPRESSION, ?PNG_SUPPORTED_FILTERING} ->
-                    Img = #image{ headers = ChunkData , contents = [] },
+                    Img = #image{ headers = ChunkData , contents = [], width = Width },
                     process_chunks(Rest, Img, Zlib);
                 _ -> {error, "unsupported image, only PNGs with 24bpp, "
                       "without filtering and zlib deflated are supported"}
@@ -102,28 +104,147 @@ process_chunk("IDAT", ChunkData, Image, Rest, Zlib) ->
     Bytes = binary_to_list(iolist_to_binary(Uncompressed)),
     Img = #image{
         headers = Image#image.headers,
-        contents = lists:append(Image#image.contents, Bytes)
+        contents = lists:append(Image#image.contents, Bytes),
+        width = Image#image.width
     },
     process_chunks(Rest, Img, Zlib);
 process_chunk("IEND", _, Image, _, Zlib) ->
     zlib:inflateEnd(Zlib),
-    <<Width:32, _/binary>> = Image#image.headers,
-    Bytes = drop_filter_bytes(Image#image.contents, Width, []),
+    Bytes = drop_filter_bytes(Image#image.contents, Image#image.width, []),
     Img = #image{
         type = png,
         contents = list_to_binary(Bytes),
-        headers = Image#image.headers
+        headers = Image#image.headers,
+        width = Image#image.width
     },
     {ok, Img};
 %% Skipping unknown chunks.
 process_chunk(_, _, Image, Rest, Zlib) ->
     process_chunks(Rest, Image, Zlib).
 
-drop_filter_bytes([_ | Contents], Width, Acc) ->
+%% Filtering
+%% See https://www.w3.org/TR/2003/REC-PNG-20031110/#9Filter-types
+%% All terminology below (x, a, b, c) is taken from there.
+
+extract_byte(Row, Index) ->
+    case Row of
+        <<_:Index/binary, Byte:8, _/binary>> -> Byte;
+        _ -> 0
+    end.
+
+filter(0, Row, _) -> Row;
+filter(1, Row, _) -> filter_sub(Row);
+filter(2, Row, PrevScanLine) -> filter_up(Row, PrevScanLine);
+filter(3, Row, PrevScanLine) -> filter_avg(Row, PrevScanLine);
+filter(4, Row, PrevScanLine) -> filter_paeth(Row, PrevScanLine).
+
+%% Sub filter machinery
+%% Recon(x) = Filt(x) + Recon(a)
+
+filter_sub(Row) ->
+    PrevPixel = [0, 0, 0],
+    Pixel = [],
+    filter_sub(Row, 0, size(Row), PrevPixel, Pixel, []).
+
+filter_sub(_, X, X, _, _, Acc) ->
+    list_to_binary(lists:reverse(Acc));
+filter_sub(Row, X, N, [PrevByte | PrevBytes], Pixel, Acc) ->
+    Byte = extract_byte(Row, X),
+    Xb = (Byte + PrevByte) band 16#FF,
+    %% Previous pixel ended, make current pixel previous.
+    if
+        length(PrevBytes) == 0 -> filter_sub(Row, X + 1, N, lists:reverse([Xb | Pixel]), [], [Xb | Acc]);
+        true -> filter_sub(Row, X + 1, N, PrevBytes, [Xb | Pixel], [Xb | Acc])
+end.
+
+%% Up filter machinery
+%% Recon(x) = Filt(x) + Recon(b)
+
+filter_up(Row, PrevScanLine) ->
+    filter_up(Row, 0, size(Row), PrevScanLine, []).
+
+filter_up(_, X, X, _, Acc) ->
+    list_to_binary(lists:reverse(Acc));
+filter_up(Row, X, N, PrevScanLine, Acc) ->
+    Byte = extract_byte(Row, X),
+    PrevScanLineByte = extract_byte(PrevScanLine, X),
+    Xb = (Byte + PrevScanLineByte) band 16#FF,
+    filter_up(Row, X + 1, N, PrevScanLine, [Xb | Acc]).
+
+%% Avg filter machinery
+%% Recon(x) = Filt(x) + floor((Recon(a) + Recon(b)) / 2)
+
+filter_avg(Row, PrevScanLine) ->
+    PrevPixel = [0, 0, 0],
+    Pixel = [],
+    filter_avg(Row, 0, size(Row), PrevScanLine, PrevPixel, Pixel, []).
+
+filter_avg(_, X, X, _, _, _, Acc) ->
+    list_to_binary(lists:reverse(Acc));
+filter_avg(Row, X, N, PrevScanLine, [PrevByte | PrevBytes], Pixel, Acc) ->
+    Byte = extract_byte(Row, X),
+    PrevScanLineByte = extract_byte(PrevScanLine, X),
+    Xb = (Byte + ((PrevByte + PrevScanLineByte) div 2)) band 16#FF,
+    if
+        length(PrevBytes) == 0 -> filter_avg(
+            Row, X + 1, N, PrevScanLine, lists:reverse([Xb | Pixel]), [], [Xb | Acc]);
+        true -> filter_avg(Row, X + 1, N, PrevScanLine, PrevBytes, [Xb | Pixel], [Xb | Acc])
+end.
+
+%% Paeth filter machinery
+%% Recon(x) = Filt(x) + PaethPredictor(Recon(a), Recon(b), Recon(c))
+
+discrete_abs(X, Y) when X > Y ->
+    X - Y;
+discrete_abs(X, Y) ->
+    Y - X.
+
+paeth_predictor(A, B, C) ->
+    P = A + B - C,
+    PA = discrete_abs(P, A),
+    PB = discrete_abs(P, B),
+    PC = discrete_abs(P, C),
+    if
+        PA =< PB, PA =< PC -> A;
+        PB =< PC -> B;
+        true -> C
+    end.
+
+filter_paeth(Row, PrevScanLine) ->
+    PrevPixel = [0, 0, 0],
+    Pixel = [],
+    PrevUpPixel = [0, 0, 0],
+    UpPixel = [],
+    filter_paeth(Row, 0, size(Row), PrevScanLine, PrevPixel, Pixel, PrevUpPixel, UpPixel, []).
+
+filter_paeth(_, X, X, _, _, _, _, _, Acc) ->
+    list_to_binary(lists:reverse(Acc));
+filter_paeth(Row, X, N, PrevScanLine, [PrevByte | PrevBytes], Pixel, [PrevUpByte | PrevUpBytes], UpPixel, Acc) ->
+    Byte = extract_byte(Row, X),
+    PrevScanLineByte = extract_byte(PrevScanLine, X),
+    Xb = (Byte + paeth_predictor(PrevByte, PrevScanLineByte, PrevUpByte)) band 16#FF,
+    if
+        length(PrevBytes) == 0 -> filter_paeth(
+            Row, X + 1, N, PrevScanLine,
+            lists:reverse([Xb | Pixel]), [],
+            lists:reverse([PrevScanLineByte | UpPixel]), [],
+            [Xb | Acc]);
+        true -> filter_paeth(Row, X + 1, N, PrevScanLine,
+            PrevBytes, [Xb | Pixel],
+            PrevUpBytes, [PrevScanLineByte | UpPixel],
+            [Xb | Acc])
+end.
+
+drop_filter_bytes([Filter | Contents], Width, Acc) ->
     {Head, Tail} = lists:split(Width * 3, Contents),
-    drop_filter_bytes(Tail, Width, lists:append(lists:reverse(Head), Acc));
+    PrevScanLine = case Acc of
+        [] -> <<>>;
+        [First | _] -> First
+    end,
+    Row = filter(Filter, list_to_binary(Head), PrevScanLine),
+    drop_filter_bytes(Tail, Width, [Row | Acc]);
 drop_filter_bytes([], _, Acc) ->
-    lists:reverse(Acc).
+    binary_to_list(list_to_binary(lists:reverse(Acc))).
 
 detect_image_type(Contents) ->
     case Contents of
@@ -173,8 +294,7 @@ write_image(Image, FileName) ->
         png ->
             Zlib = zlib:open(),
             zlib:deflateInit(Zlib),
-            %% TODO(asaitgalin): Store it in separate field in record?
-            <<Width:32, _/binary>> = Image#image.headers,
+            Width = Image#image.width,
             Chunks = compress_chunks(
                 add_filter_byte(binary_to_list(Image#image.contents), Width, []),
                 Zlib,
@@ -224,7 +344,8 @@ insert_text_to_image(Image, Text) ->
     #image{
         type = Image#image.type,
         headers = Image#image.headers,
-        contents = list_to_binary(encode(TextBytesWithLength, ImageBytes, []))
+        contents = list_to_binary(encode(TextBytesWithLength, ImageBytes, [])),
+        width = Image#image.width
     }.
 
 extract_bytes(_, 0, Acc) ->
