@@ -108,7 +108,6 @@ process_chunk("IDAT", ChunkData, Image, Rest, Zlib) ->
 process_chunk("IEND", _, Image, _, Zlib) ->
     zlib:inflateEnd(Zlib),
     <<Width:32, _/binary>> = Image#image.headers,
-    file:write_file("before_dropping.bin", Image#image.contents),
     Bytes = drop_filter_bytes(Image#image.contents, Width, []),
     Img = #image{
         type = png,
